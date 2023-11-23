@@ -3,10 +3,9 @@ Thanks: MixMatch-Pytorch
 """
 import numpy as np
 import torchvision
-from torchvision import transforms, datasets
-
 from datasets.dataset_setup import DatasetSetup
 from my_utils.utils import train_val_split
+from torchvision import datasets, transforms
 
 
 class Cifar10Setup(DatasetSetup):

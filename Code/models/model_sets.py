@@ -2,11 +2,11 @@
 If you use this implementation in you work, please don't forget to mention the
 author, Yerlan Idelbayev.
 """
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from my_utils.utils import weights_init,  BasicBlock
-import torch
 from models.mixtext import MixText
+from my_utils.utils import BasicBlock, weights_init
 
 
 class ResNet(nn.Module):
@@ -421,8 +421,11 @@ def update_top_model_one_batch(optimizer, model, output, batch_target, loss_func
 
 def update_bottom_model_one_batch(optimizer, model, output, batch_target, loss_func):
     loss = loss_func(output, batch_target)
+    # clear grads on all weights
     optimizer.zero_grad()
+    # compute new grads on all weights
     loss.backward()
+    # conduct weights update
     optimizer.step()
     return
 

@@ -1,26 +1,28 @@
 import argparse
 import ast
 import os
-import time
-import dill
-from time import time
 import sys
+import time
+from time import time
+
+import dill
+
 sys.path.insert(0, "./")
 
+import matplotlib.pyplot as plt
+import my_optimizers
+import pandas as pd
+import possible_defenses
 import torch
+import torch.backends.cudnn as cudnn
 import torch.nn as nn
 import torch.nn.parallel
-import torch.backends.cudnn as cudnn
 import torch.optim as optim
 import torch.utils.data
-import matplotlib.pyplot as plt
-from sklearn.manifold import TSNE
-import pandas as pd
 from datasets import get_dataset
-from my_utils import utils
 from models import model_sets
-import my_optimizers
-import possible_defenses
+from my_utils import utils
+from sklearn.manifold import TSNE
 
 plt.switch_backend('agg')
 
@@ -228,7 +230,8 @@ class VflFramework(nn.Module):
         # read grad of: input of top model(also output of bottom models), which will be used as bottom model's target
         grad_output_bottom_model_a = input_tensor_top_model_a.grad
         grad_output_bottom_model_b = input_tensor_top_model_b.grad
-
+        # print(grad_output_bottom_model_a.shape)
+        
         # defenses here: the server(who controls top model) can defend against label inference attack by protecting
         # print("before defense, grad_output_bottom_model_a:", grad_output_bottom_model_a)
         # gradients sent to bottom models
@@ -665,3 +668,5 @@ if __name__ == '__main__':
     if args.use_mal_optim_all:
         args.use_mal_optim = True
     main()
+
+    # python vfl_framework.py --use-mal-optim False --use-mal-optim-all False --use-mal-optim-top False -d CIFAR10 --path-dataset ./data/CIFAR10  --k 4 --epochs 10 --half 16
