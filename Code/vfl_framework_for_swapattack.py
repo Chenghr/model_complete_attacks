@@ -1,5 +1,6 @@
 import argparse
 import ast
+import copy
 import os
 import random
 import sys
@@ -7,11 +8,13 @@ import time
 from time import time
 
 import dill
+from colorama import Back, Fore, Style, init
 
 sys.path.insert(0, "./")
 
 import matplotlib.pyplot as plt
 import my_optimizers
+import numpy as np
 import pandas as pd
 import possible_defenses
 import torch
@@ -25,6 +28,7 @@ from models import model_sets
 from my_utils import utils
 from sklearn.manifold import TSNE
 from torch.utils.data.sampler import SequentialSampler
+from utils_for_swapAttack import judge_converge
 
 plt.switch_backend("agg")
 
@@ -83,7 +87,7 @@ def set_train_loader():
             sampler=MySequentialSampler(origin_sample_ids)
             # num_workers=args.workers
         )
-    
+
     # check size_bottom_out and num_classes
     if args.use_top_model is False:
         if dataset_setup.size_bottom_out != dataset_setup.num_classes:
@@ -145,6 +149,10 @@ class VflFramework(nn.Module):
     def __init__(self, setting_str=None):
         super(VflFramework, self).__init__()
         self.setting_str = setting_str  # counter for direct label inference attack
+        self.train_loader = None    # set for swap attack.
+        # get num_classes
+        dataset_setup = get_dataset.get_dataset_setup_by_name(args.dataset)
+        self.num_classes = dataset_setup.num_classes
         self.inferred_correct = 0
         self.inferred_wrong = 0
         # bottom model a can collect output_a and grads for label inference attack
@@ -304,7 +312,8 @@ class VflFramework(nn.Module):
             out = out_a + out_b
         return out
 
-    def simulate_normal_train_round_per_batch(self, data, target, batch_sample_idxes):
+    def _simulate_train_batch(self, data, target, batch_id, batch_sample_ids, 
+                              is_swapAttack=False, target_label=None):
         timer_mal = 0
         timer_benign = 0
         # simulate: bottom models forward, top model forward, top model backward and update, bottom backward and update
@@ -322,8 +331,12 @@ class VflFramework(nn.Module):
         # --bottom models forward--
         x_a, x_b = split_data(data)
 
-        # make x_b random noise
-        # x_b = torch.rand_like(x_b)
+        # swap attack here
+        if is_swapAttack:
+            # change x_a
+            target_batch_ids = self.target_batch_ids[batch_id]
+            target_sample_ids = self.target_sample_ids[batch_id]
+            x_a = self._swap_data(x_a, target_batch_ids, target_label)
 
         # -bottom model A-
         self.malicious_bottom_model_a.train(mode=True)
@@ -333,11 +346,6 @@ class VflFramework(nn.Module):
         time_cost = end - start
         timer_mal += time_cost
 
-        # bottom model a can collect output_a for label inference attack
-        # clone will cope the message about grad.
-        # TODO: check grads here.
-        self.outputs_a[batch_sample_idxes] = output_tensor_bottom_model_a.clone()
-
         # -bottom model B-
         self.benign_bottom_model_b.train(mode=True)
         start2 = time()
@@ -345,6 +353,7 @@ class VflFramework(nn.Module):
         end2 = time()
         time_cost2 = end2 - start2
         timer_benign += time_cost2
+
         # -top model-
         # (we omit interactive layer for it doesn't effect our attack or possible defenses)
         # by concatenating output of bottom a/b(dim=10+10=20), we get input of top model
@@ -373,8 +382,22 @@ class VflFramework(nn.Module):
         grad_output_bottom_model_a = input_tensor_top_model_a.grad
         grad_output_bottom_model_b = input_tensor_top_model_b.grad
 
-        # store grads.
-        self.grads_a[batch_sample_idxes] = grad_output_bottom_model_a.detach()
+        # bottom model a can collect output_a and grads_a for label inference attack
+        # clone will cope the message about grad.
+        if not is_swapAttack:
+            self.outputs_a[batch_sample_ids] = output_tensor_bottom_model_a.clone()
+            self.grads_a[batch_sample_ids] = grad_output_bottom_model_a.detach()
+        else:
+            if len(target_batch_ids) > 0:
+                for i, batch_id in enumerate(target_batch_ids):
+                    l2_norm_grad = torch.norm(grad_output_bottom_model_a[batch_id].detach(), p=2).item()
+                    self.swap_grads[batch_id][i].append(l2_norm_grad)
+
+                    l2_norm_grad_dis = torch.norm(
+                        grad_output_bottom_model_a[batch_id].detach() - self.grads_a[target_sample_ids[i]],
+                        p=2,
+                    ).item()
+                    self.swap_grads_dis[batch_id][i].append(l2_norm_grad_dis)
 
         # defenses here: the server(who controls top model) can defend against label inference attack by protecting
         # print("before defense, grad_output_bottom_model_a:", grad_output_bottom_model_a)
@@ -441,17 +464,19 @@ class VflFramework(nn.Module):
         # --bottom models backward/update--
         # -bottom model a: backward/update-
         # print("malicious_bottom_model_a")
-        start = time()
-        model_sets.update_bottom_model_one_batch(
-            optimizer=self.optimizer_malicious_bottom_model_a,
-            model=self.malicious_bottom_model_a,
-            output=output_tensor_bottom_model_a,
-            batch_target=grad_output_bottom_model_a,
-            loss_func=self.loss_func_bottom_model,
-        )
-        end = time()
-        time_cost = end - start
-        timer_mal += time_cost
+        if not is_swapAttack:
+            # not update during swapAttack
+            start = time()
+            model_sets.update_bottom_model_one_batch(
+                optimizer=self.optimizer_malicious_bottom_model_a,
+                model=self.malicious_bottom_model_a,
+                output=output_tensor_bottom_model_a,
+                batch_target=grad_output_bottom_model_a,
+                loss_func=self.loss_func_bottom_model,
+            )
+            end = time()
+            time_cost = end - start
+            timer_mal += time_cost
         # -bottom model b: backward/update-
         # print("benign_bottom_model_b")
         model_sets.update_bottom_model_one_batch(
@@ -471,6 +496,31 @@ class VflFramework(nn.Module):
 
         return loss_framework
 
+    def _swap_data(self, x_a, target_batch_ids, target_label):
+        """ x_a: batch data of participant a, tensor
+        """
+        if len(target_batch_ids) == 0:
+            return x_a
+        
+        swapped_feat = self._get_labeled_feat(self, target_label)
+        for id in target_batch_ids:
+            x_a[id] = torch.clone(swapped_feat)
+        
+        return x_a
+    
+    def _get_labeled_feat(self, target_label):
+        """Select the sample with the smallest gradient norm among multiple labeled samples.
+        """
+        candidate_ids = self.labeled_sample_ids[target_label]
+        if len(candidate_ids) == 1:
+           target_sample_id = candidate_ids[0]
+        else:
+            l2_norm_grads = torch.norm(self.grads_a[candidate_ids], dim=1)
+            target_sample_id = candidate_ids[torch.argmin(l2_norm_grads)]
+
+        feat, _ = self.train_loader.dataset[target_sample_id]
+        return feat
+
     def normal_train_epoch(self, train_loader, origin_sample_ids, schedulers, epoch):
         print(
             "model.optimizer_top_model current lr {:.5e}".format(
@@ -489,9 +539,8 @@ class VflFramework(nn.Module):
         )
 
         if self.outputs_a is None:
-            dataset_setup = get_dataset.get_dataset_setup_by_name(args.dataset)
             data = [
-                [-1.0 for _ in range(dataset_setup.size_bottom_out)]
+                [-1.0 for _ in range(self.num_classes)]
                 for _ in range(len(origin_sample_ids))
             ]
             self.outputs_a = torch.tensor(data).to(torch.float).cuda()
@@ -502,7 +551,7 @@ class VflFramework(nn.Module):
                 .cuda()
             )
 
-        for batch_idx, (data, target) in enumerate(train_loader):
+        for batch_id, (data, target) in enumerate(train_loader):
             # move data to GPU.
             if args.dataset == "Yahoo":
                 for i in range(len(data)):
@@ -512,16 +561,16 @@ class VflFramework(nn.Module):
                 data = data.float().cuda()
                 target = target.long().cuda()
 
-            start = batch_idx * args.batch_size
-            end = min((batch_idx + 1) * args.batch_size, len(origin_sample_ids))
+            start = batch_id * args.batch_size
+            end = min((batch_id + 1) * args.batch_size, len(origin_sample_ids))
             batch_sample_idxes = origin_sample_ids[start:end]
 
             # cal loss per batch
-            loss_framework = self.simulate_normal_train_round_per_batch(
-                data, target, batch_sample_idxes
+            loss_framework = self._simulate_train_batch(
+                data, target, batch_id, batch_sample_idxes, is_swapAttack=False
             )
 
-            if batch_idx % 25 == 0:
+            if batch_id % 25 == 0:
                 if args.dataset == "Criteo":
                     num_samples = len(train_loader) * BATCH_SIZE
                 else:
@@ -529,9 +578,9 @@ class VflFramework(nn.Module):
                 print(
                     "Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}".format(
                         epoch,
-                        batch_idx * len(data),
+                        batch_id * len(data),
                         num_samples,
-                        100.0 * batch_idx / len(train_loader),
+                        100.0 * batch_id / len(train_loader),
                         loss_framework.data.item(),
                     )
                 )
@@ -539,14 +588,21 @@ class VflFramework(nn.Module):
         for scheduler in schedulers:
             scheduler.step()
 
-    def test(self, test_loader, k=5, loss_func_top_model=None, is_train_loader=False, origin_sample_ids=None):
+    def test(
+        self,
+        test_loader,
+        k=5,
+        loss_func_top_model=None,
+        is_train_loader=False,
+        origin_sample_ids=None,
+    ):
         test_loss = 0
         correct_top1 = 0
         correct_topk = 0
         count = 0
         with torch.no_grad():
             for batch_idx, (data, target) in enumerate(test_loader):
-            # for data, target in test_loader:
+                # for data, target in test_loader:
                 if args.dataset == "Yahoo":
                     for i in range(len(data)):
                         data[i] = data[i].long().cuda()
@@ -593,7 +649,9 @@ class VflFramework(nn.Module):
                     end = min((batch_idx + 1) * args.batch_size, len(origin_sample_ids))
                     batch_sample_idxes = origin_sample_ids[start:end]
 
-                    _, pred = output_framework_clone.topk(1, dim=1, largest=True, sorted=True)
+                    _, pred = output_framework_clone.topk(
+                        1, dim=1, largest=True, sorted=True
+                    )
                     is_correct = torch.eq(pred, target.view(-1, 1)).flatten()
                     self.is_model_output_correct[batch_sample_idxes] = is_correct
 
@@ -615,6 +673,25 @@ class VflFramework(nn.Module):
                 )
             )
 
+    def eval(self, train_loader, val_loader, origin_sample_ids):
+        """eval model after each train.
+        """
+        print("Evaluation on the training dataset:")
+        self.test(
+            test_loader=train_loader,
+            k=args.k,
+            loss_func_top_model=self.loss_func_top_model,
+            is_train_loader=True,
+            origin_sample_ids=origin_sample_ids,
+        )
+
+        print("Evaluation on the testing dataset:")
+        self.test(
+            test_loader=val_loader,
+            k=args.k,
+            loss_func_top_model=self.loss_func_top_model,
+        )
+
     @staticmethod
     def correct_counter(output, target, topk=(1, 5)):
         correct_counts = []
@@ -629,34 +706,116 @@ class VflFramework(nn.Module):
         and we assume that the labeled samples are the ones for which the model fits correctly.
         Therefore, we select here based on the model prediction results and the norm of the gradient.
         """
-        # get num_classes
-        dataset_setup = get_dataset.get_dataset_setup_by_name(args.dataset)
-        num_classes = dataset_setup.num_classes
-        self.labeled_sample_ids = [[] for _ in range(num_classes)]
-        
         targets = train_loader.dataset.targets
+        # Mark whether the sample has been attacked
+        self.attacked_sample_ids = torch.tensor([False for _ in len(targets)])
+
+        self.labeled_sample_ids = [[] for _ in range(self.num_classes)]
         labeled_num = args.labeled_perclass
 
         # sort according to gradient from small to large
         l2_norm_per_row = torch.norm(self.grads_a, dim=1)
         sorted_values, sorted_indices = torch.sort(l2_norm_per_row)
-        
-        count = num_classes*labeled_num
+
+        count = self.num_classes * labeled_num
         for l2_norm, id in zip(sorted_values, sorted_indices):
             if self.is_model_output_correct[id]:
                 class_id = targets[id]
                 if len(self.labeled_sample_ids[class_id]) < labeled_num:
                     self.labeled_sample_ids[class_id].append(id.item())
+                    self.attacked_sample_ids[id] = True
                     count -= 1
-            
+
             if count == 0:
                 break
 
-        print("Labeled samples are generated:", self.labeled_sample_ids)
+        print(f"{Style.BRIGHT}{Fore.RED}Labeled samples are generated: {self.labeled_sample_ids}{Style.RESET_ALL}")
         # print("Predict result:", self.is_model_output_correct[torch.tensor(self.labeled_sample_ids).flatten()].tolist())
-        # print("Grads indices:", l2_norm_per_row[torch.tensor(self.labeled_sample_ids).flatten()].tolist())
-        # print("Max grads:", sorted_values[-10:])
-        
+        print("Grads indices:", l2_norm_per_row[torch.tensor(self.labeled_sample_ids).flatten()].tolist())
+        print("Max grads:", sorted_values[-10:])
+
+    def gen_target_ids(self, origin_sample_ids):
+        """
+            Generate an index of samples to be attacked for the current attack period.
+            Select target samples based on gradient norm.
+        """
+        print("Start generate targets ids per attack period.")
+        l2_norm_samples = torch.norm(self.grads_a, dim=1)
+        self.target_sample_ids, self.target_batch_ids, self.swap_grads = [], [], []
+
+        start, end = 0, args.batch_size
+        while start <= end:
+            batch_sample_ids = origin_sample_ids[start: end]
+            l2_norm_batch = l2_norm_samples[batch_sample_ids]
+            sorted_indices = torch.argsort(l2_norm_batch)
+
+            target_sample_ids_b, target_batch_ids_b, swap_grads_b = [], [], []
+            for batch_id in sorted_indices:
+                sample_id = batch_sample_ids[batch_id]
+                
+                if not self.attacked_sample_ids[sample_id]:
+                    target_sample_ids_b.append(sample_id)
+                    target_batch_ids_b.append(batch_id)
+                    swap_grads_b.append([])
+
+                if len(target_sample_ids_b) == args.num_swap_batch:
+                    break
+            
+            self.target_sample_ids.append(target_sample_ids_b)
+            self.target_batch_ids.append(target_batch_ids_b)
+            self.swap_grads.append(swap_grads_b)
+
+            start += args.batch_size
+            end += args.batch_size
+            end = min(end, len(origin_sample_ids))
+
+        self.swap_grads_dis = copy.deepcopy(self.swap_grads)
+        print("Generate targets ids done.")
+        return 
+    
+    def swap_attack_epoch(self, train_loader, origin_sample_ids, schedulers, epoch, target_label):
+        if epoch >= args.epochs:
+            return
+
+        print(f"Start swap attack epoch, target calss: {target_label}")
+        for batch_id, (data, target) in enumerate(train_loader):
+            # move data to GPU.
+            if args.dataset == "Yahoo":
+                for i in range(len(data)):
+                    data[i] = data[i].long().cuda()
+                target = target[0].long().cuda()
+            else:
+                data = data.float().cuda()
+                target = target.long().cuda()
+
+            start = batch_id * args.batch_size
+            end = min((batch_id + 1) * args.batch_size, len(origin_sample_ids))
+            batch_sample_idxes = origin_sample_ids[start:end]
+
+            # cal loss per batch
+            loss_framework = self._simulate_train_batch(
+                data, target, batch_id, batch_sample_idxes, 
+                is_swapAttack=True, target_label=target_label,
+            )
+
+            if batch_id % 25 == 0:
+                if args.dataset == "Criteo":
+                    num_samples = len(train_loader) * BATCH_SIZE
+                else:
+                    num_samples = len(train_loader.dataset)
+                print(
+                    "Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}".format(
+                        epoch,
+                        batch_id * len(data),
+                        num_samples,
+                        100.0 * batch_id / len(train_loader),
+                        loss_framework.data.item(),
+                    )
+                )
+
+        for scheduler in schedulers:
+            scheduler.step()
+
 
 def gen_setting_str():
     # write experiment setting into file name
@@ -698,8 +857,148 @@ def gen_setting_str():
         setting_str += str(args.half)
     if not args.use_top_model:
         setting_str += "_NoTopModel"
+    if args.swap_attack:
+        setting_str += "-epoch="
+        setting_str += str(args.epochs)
+        setting_str += "-attack_latest_epoch="
+        setting_str += str(args.attack_latest_epoch)
+        setting_str += "-labeled_perclass="
+        setting_str += str(args.labeled_perclass)
     print("settings:", setting_str)
     return setting_str
+
+
+def swapAttack():
+    setting_str = gen_setting_str()
+    model = VflFramework(setting_str)
+    model = model.cuda()
+    cudnn.benchmark = True
+
+    stone1 = args.stone1  # 50 int(args.epochs * 0.5)
+    stone2 = args.stone2  # 85 int(args.epochs * 0.8)
+    lr_scheduler_top_model = torch.optim.lr_scheduler.MultiStepLR(
+        model.optimizer_top_model, milestones=[stone1, stone2], gamma=args.step_gamma
+    )
+    lr_scheduler_m_a = torch.optim.lr_scheduler.MultiStepLR(
+        model.optimizer_malicious_bottom_model_a,
+        milestones=[stone1, stone2],
+        gamma=args.step_gamma,
+    )
+    lr_scheduler_b_b = torch.optim.lr_scheduler.MultiStepLR(
+        model.optimizer_benign_bottom_model_b,
+        milestones=[stone1, stone2],
+        gamma=args.step_gamma,
+    )
+    schedulers = [lr_scheduler_top_model, lr_scheduler_m_a, lr_scheduler_b_b]
+
+    dir_save_model = args.save_dir + f"/saved_models/{args.dataset}_saved_models"
+    if not os.path.exists(dir_save_model):
+        os.makedirs(dir_save_model)
+
+    epoch, attack_period = 0, 0
+    val_loader = set_test_loader()
+
+    is_start_swapAttack, grads_a_epochs = False, []
+    target_sample_ids, inferred_labels = [], []
+
+    while epoch < args.epochs:
+        # shuffle data each epoch.
+        train_loader, origin_sample_ids = set_train_loader()
+
+        # judge whether to start swapAttack
+        if not is_start_swapAttack:
+            if epoch >= args.attack_latest_epoch or (judge_converge(grads_a_epochs, args.slope_threshold)):
+                is_start_swapAttack = True
+                model.gen_labeled_samples(train_loader)
+
+        if not is_start_swapAttack:
+            # conduct normal train
+            model.normal_train_epoch(train_loader, origin_sample_ids, schedulers, epoch)
+            model.eval(train_loader, val_loader, origin_sample_ids)
+            epoch += 1
+
+            # store average grads
+            # TODO: optimize functions here.
+            grads_a_average = torch.mean(torch.norm(model.grads_a, dim=1))
+            grads_a_epochs.append(grads_a_average.item())
+        else:
+            # conduct swap attack.
+            # for each period of swap attack, we conduct one normal train and n swap train.
+            # in the period of swap attack, the train loader keep the same.
+            model.gen_target_ids(origin_sample_ids)
+            model.normal_train_epoch(train_loader, origin_sample_ids, schedulers, epoch)
+            model.eval(train_loader, val_loader, origin_sample_ids)
+            epoch += 1
+
+            for target_label in list(range(model.num_classes)):
+                model.swap_attack_epoch(train_loader, origin_sample_ids, schedulers, epoch, target_label)
+                epoch += 1
+            
+            # gen attack results and fix attack results.
+            target_sample_ids_period, inferred_labels_period = [], []
+            for batch_id in range(len(model.target_batch_ids)):
+                for i, sample_id in enumerate(model.target_sample_ids[batch_id]):
+                    diss = np.array(model.swap_grads_dis[batch_id][i])
+                    inferred_label = int(diss.argmin())
+
+                    if args.attack_optim:
+                        min_abnormal_grad = min(model.swap_grads[batch_id][i])
+                        normal_grad = torch.norm(model.grads_a[sample_id], p=2).item()
+                        if min_abnormal_grad <= normal_grad * args.optimal_ratio:
+                            inferred_label = int(np.array(model.swap_grads[batch_id][i]).argmin())
+                    
+                    target_sample_ids_period.append(sample_id)
+                    inferred_labels_period.append(inferred_label)
+
+            if len(target_sample_ids_period) > 0:
+                target_sample_ids.extend(target_sample_ids_period)
+                inferred_labels.extend(inferred_labels_period)
+                
+            attack_evaluation(train_loader, model.num_classes, 
+                              target_sample_ids_period, inferred_labels_period, attack_period)
+        
+        attack_evaluation(train_loader, model.num_classes, 
+                            target_sample_ids_period, inferred_labels_period, is_attack_finished=True)
+
+        if epoch == args.epochs:
+            txt_name = f"{args.dataset}_swapAttack{setting_str}"
+            savedStdout = sys.stdout
+            with open(dir_save_model + "/" + txt_name + ".txt", "w+") as file:
+                sys.stdout = file
+                model.eval(train_loader, val_loader, origin_sample_ids)
+                attack_evaluation(train_loader, model.num_classes, 
+                                    target_sample_ids_period, inferred_labels_period, is_attack_finished=True)
+                sys.stdout = savedStdout
+            print("Last epoch evaluation saved to txt!")
+
+    # save model.
+    torch.save(
+        model,
+        os.path.join(
+            dir_save_model, f"{args.dataset}_swapAttack{setting_str}.pth"
+        ),
+        pickle_module=dill,
+    )
+
+def attack_evaluation(train_loader, num_class, target_sample_ids, inferred_labels,
+                      attack_period=-1, is_attack_finished=False):
+    y_true = train_loader.datasets.targets[target_sample_ids].tolist()
+    target_samples_count = len(train_loader.datasets.targets) - args.labeled_perclass*num_class
+
+    if len(y_true) != len(inferred_labels):
+        raise ValueError("Lengths of y_true and inferred_labels must be the same.")
+    
+    correct_count = sum(1 for true, pred in zip(y_true, inferred_labels) if true == pred)
+    attack_accuracy = correct_count / len(y_true)
+
+    if not is_attack_finished:
+        print(f"{Style.BRIGHT}{Fore.RED}Attack period  : {attack_period}{Style.RESET_ALL}")
+    else:
+        print(f"{Style.BRIGHT}{Fore.RED}Swap Attack done. {Style.RESET_ALL}")
+    
+    print(f"{Style.BRIGHT}{Fore.RED}Attack Num     : {len(inferred_labels)}{Style.RESET_ALL}")
+    print(f"{Style.BRIGHT}{Fore.RED}Attack ratio   : {len(inferred_labels)/target_samples_count: .4f}{Style.RESET_ALL}")
+    print(f"{Style.BRIGHT}{Fore.RED}Attack accuracy: {attack_accuracy: .4f}{Style.RESET_ALL}")
 
 
 def main():
@@ -732,36 +1031,19 @@ def main():
     if not os.path.exists(dir_save_model):
         os.makedirs(dir_save_model)
 
-    # prepare data for attack.
-
     # start training. do evaluation every epoch.
-    # TODO: start attack here.
     for epoch in range(args.epochs):
         # shuffle data each epoch.
         train_loader, origin_sample_ids = set_train_loader()
-
+        model.train_loader = train_loader
+        
         if epoch == args.epochs - 1 and args.if_cluster_outputsA:
             model.if_collect_training_dataset_labels = True
 
         # conduct normal training
         model.normal_train_epoch(train_loader, origin_sample_ids, schedulers, epoch)
-
         # model eval each epoch:
-        print("Evaluation on the training dataset:")
-        model.test(
-            test_loader=train_loader,
-            k=args.k,
-            loss_func_top_model=model.loss_func_top_model,
-            is_train_loader=True,
-            origin_sample_ids=origin_sample_ids,
-        )
-        
-        print("Evaluation on the testing dataset:")
-        model.test(
-            test_loader=val_loader,
-            k=args.k,
-            loss_func_top_model=model.loss_func_top_model,
-        )
+        model.eval(train_loader, val_loader, origin_sample_ids)
 
         if epoch == args.epochs - 1:
             model.gen_labeled_samples(train_loader)
@@ -769,38 +1051,9 @@ def main():
             savedStdout = sys.stdout
             with open(dir_save_model + "/" + txt_name + ".txt", "w+") as file:
                 sys.stdout = file
-                print("Evaluation on the training dataset:")
-                model.test(
-                    test_loader=train_loader,
-                    k=args.k,
-                    loss_func_top_model=model.loss_func_top_model,
-                )
-                print("Evaluation on the testing dataset:")
-                model.test(
-                    test_loader=val_loader,
-                    k=args.k,
-                    loss_func_top_model=model.loss_func_top_model,
-                )
-
-                if not args.use_top_model:
-                    # performance of the direct label inference attack
-                    print("inferred correctly:", model.inferred_correct)
-                    if args.dataset == "Criteo":
-                        num_samples = len(train_loader) * BATCH_SIZE
-                    else:
-                        num_samples = len(train_loader.dataset)
-                    num_all_train_samples = num_samples
-                    print("all:", num_all_train_samples)
-                    print(
-                        "Direct label inference accuracy:",
-                        model.inferred_correct / num_all_train_samples,
-                    )
-                    print("Direct label inference attack evaluated...")
-
+                model.eval(train_loader, val_loader, origin_sample_ids)
                 sys.stdout = savedStdout
             print("Last epoch evaluation saved to txt!")
-    
-    
 
     # save model
     torch.save(
@@ -824,10 +1077,7 @@ def main():
         )
         # plot the TSNE result
         colors = ["k", "r", "y", "g", "c", "b", "m", "grey", "orange", "pink"]
-        # get num_classes
-        dataset_setup = get_dataset.get_dataset_setup_by_name(args.dataset)
-        num_classes = dataset_setup.num_classes
-        for i in range(num_classes):
+        for i in range(model.num_classes):
             plt.scatter(
                 df_outputsA_pca_tsne.loc[i][0],
                 df_outputsA_pca_tsne.loc[i][1],
@@ -850,9 +1100,7 @@ def main():
         )
         plt.close()
 
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="vfl framework training")
+def set_parser(parser):
     # dataset paras
     parser.add_argument(
         "-d",
@@ -876,16 +1124,6 @@ if __name__ == "__main__":
         type=str,
         default="./data/CIFAR10",
     )
-    """
-    'D:/Datasets/CIFAR10'
-    'D:/Datasets/CIFAR100'
-    'D:/Datasets/TinyImageNet'
-    'D:/Datasets/CINIC10L'
-    'D:/Datasets/BC_IDC'
-    'D:/Datasets/Criteo/criteo1e?.csv'
-    'D:/Datasets/yahoo_answers_csv/'
-    'D:/Datasets/BreastCancerWisconsin/wisconsin.csv'
-    """
     # framework paras
     parser.add_argument(
         "--use-top-model",
@@ -1078,7 +1316,30 @@ if __name__ == "__main__":
         metavar="N",
         help="number of labeled samples in each class or target class.",
     )
+    parser.add_argument(
+        "--slope-threshold",
+        "--st",
+        default=0.0001,
+        type=float,
+        metavar="S",
+        help="gradient slope threshold to determine whether to start an attack.",
+    )
+    parser.add_argument(
+        "--attack-optim",
+        type=ast.literal_eval,
+        default=False,
+        help="whether to perform attack optimization",
+    )
+    parser.add_argument(
+        "--optimal-ratio",
+        default=0.5,
+        type=float,
+        metavar="S",
+        help="Constraints on attack optimization. The smaller it is, the stricter it is..",
+    )
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="vfl framework training")
+    set_parser(parser)
     args = parser.parse_args()
-    if args.use_mal_optim_all:
-        args.use_mal_optim = True
-    main()
+    swapAttack()
