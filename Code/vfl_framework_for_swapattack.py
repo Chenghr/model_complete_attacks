@@ -47,109 +47,11 @@ class MySequentialSampler(SequentialSampler):
         return len(self.data_source)
 
 
-def split_data(data):
-    if args.dataset == "Yahoo":
-        x_b = data[1]
-        x_a = data[0]
-    elif args.dataset in ["CIFAR10", "CIFAR100", "CINIC10L"]:
-        x_a = data[:, :, :, 0 : args.half]
-        x_b = data[:, :, :, args.half : 32]
-    elif args.dataset == "TinyImageNet":
-        x_a = data[:, :, :, 0 : args.half]
-        x_b = data[:, :, :, args.half : 64]
-    elif args.dataset == "Criteo":
-        x_b = data[:, args.half : D_]
-        x_a = data[:, 0 : args.half]
-    elif args.dataset == "BCW":
-        x_b = data[:, args.half : 28]
-        x_a = data[:, 0 : args.half]
-    else:
-        raise Exception("Unknown dataset name!")
-    if args.test_upper_bound:
-        x_b = torch.zeros_like(x_b)
-    return x_a, x_b
-
-
-def set_train_loader():
-    dataset_setup = get_dataset.get_dataset_setup_by_name(args.dataset)
-    train_dataset = dataset_setup.get_transformed_dataset(args.path_dataset, None, True)
-
-    origin_sample_ids = list(range(len(train_dataset)))
-    random.shuffle(origin_sample_ids)
-
-    if args.dataset == "Criteo":
-        train_loader = train_dataset
-    else:
-        train_loader = torch.utils.data.DataLoader(
-            dataset=train_dataset,
-            batch_size=args.batch_size,
-            shuffle=False,
-            sampler=MySequentialSampler(origin_sample_ids)
-            # num_workers=args.workers
-        )
-
-    # check size_bottom_out and num_classes
-    if args.use_top_model is False:
-        if dataset_setup.size_bottom_out != dataset_setup.num_classes:
-            raise Exception(
-                "If no top model is used,"
-                " output tensor of the bottom model must equal to number of classes."
-            )
-
-    return train_loader, origin_sample_ids
-
-
-def set_test_loader():
-    dataset_setup = get_dataset.get_dataset_setup_by_name(args.dataset)
-    test_dataset = dataset_setup.get_transformed_dataset(args.path_dataset, None, False)
-
-    if args.dataset == "Criteo":
-        test_loader = test_dataset
-    else:
-        test_loader = torch.utils.data.DataLoader(
-            dataset=test_dataset,
-            batch_size=args.batch_size,
-            # num_workers=args.workers
-        )
-
-    return test_loader
-
-
-def set_loaders():
-    dataset_setup = get_dataset.get_dataset_setup_by_name(args.dataset)
-    train_dataset = dataset_setup.get_transformed_dataset(args.path_dataset, None, True)
-    test_dataset = dataset_setup.get_transformed_dataset(args.path_dataset, None, False)
-
-    if args.dataset == "Criteo":
-        train_loader = train_dataset
-        test_loader = test_dataset
-    else:
-        train_loader = torch.utils.data.DataLoader(
-            dataset=train_dataset,
-            batch_size=args.batch_size,
-            shuffle=True,
-            # num_workers=args.workers
-        )
-        test_loader = torch.utils.data.DataLoader(
-            dataset=test_dataset,
-            batch_size=args.batch_size,
-            # num_workers=args.workers
-        )
-    # check size_bottom_out and num_classes
-    if args.use_top_model is False:
-        if dataset_setup.size_bottom_out != dataset_setup.num_classes:
-            raise Exception(
-                "If no top model is used,"
-                " output tensor of the bottom model must equal to number of classes."
-            )
-    return train_loader, test_loader
-
-
 class VflFramework(nn.Module):
     def __init__(self, setting_str=None):
         super(VflFramework, self).__init__()
         self.setting_str = setting_str  # counter for direct label inference attack
-        self.train_loader = None    # set for swap attack.
+        self.train_loader = None  # set for swap attack.
         # get num_classes
         dataset_setup = get_dataset.get_dataset_setup_by_name(args.dataset)
         self.num_classes = dataset_setup.num_classes
@@ -301,19 +203,99 @@ class VflFramework(nn.Module):
                     weight_decay=args.weight_decay,
                 )
 
-    def forward(self, x):
-        # in vertical federated setting, each party has non-lapping features of the same sample
-        x_a, x_b = split_data(x)
-        out_a = self.malicious_bottom_model_a(x_a)
-        out_b = self.benign_bottom_model_b(x_b)
-        if args.use_top_model:
-            out = self.top_model(out_a, out_b)
-        else:
-            out = out_a + out_b
-        return out
+    def simulate_train_epoch(
+        self,
+        train_loader,
+        origin_sample_ids,
+        schedulers,
+        epoch,
+        is_swapAttack=False,
+        target_label=-1,
+    ):
+        if epoch >= args.epochs:
+            return
 
-    def _simulate_train_batch(self, data, target, batch_id, batch_sample_ids, 
-                              is_swapAttack=False, target_label=None):
+        self.train_loader = train_loader
+        print(
+            "model.optimizer_top_model current lr {:.5e}".format(
+                self.optimizer_top_model.param_groups[0]["lr"]
+            )
+        )
+        print(
+            "model.optimizer_malicious_bottom_model_a current lr {:.5e}".format(
+                self.optimizer_malicious_bottom_model_a.param_groups[0]["lr"]
+            )
+        )
+        print(
+            "model.optimizer_benign_bottom_model_b current lr {:.5e}".format(
+                self.optimizer_benign_bottom_model_b.param_groups[0]["lr"]
+            )
+        )
+
+        if self.outputs_a is None:
+            data = [
+                [-1.0 for _ in range(self.num_classes)]
+                for _ in range(len(origin_sample_ids))
+            ]
+            self.outputs_a = torch.tensor(data).to(torch.float).cuda()
+            self.grads_a = torch.tensor(data).to(torch.float).cuda()
+            self.is_model_output_correct = (
+                torch.tensor([False for _ in range(len(origin_sample_ids))])
+                .to(torch.bool)
+                .cuda()
+            )
+
+        for batch_id, (data, target) in enumerate(train_loader):
+            # move data to GPU.
+            if args.dataset == "Yahoo":
+                for i in range(len(data)):
+                    data[i] = data[i].long().cuda()
+                target = target[0].long().cuda()
+            else:
+                data = data.float().cuda()
+                target = target.long().cuda()
+
+            start = batch_id * args.batch_size
+            end = min((batch_id + 1) * args.batch_size, len(origin_sample_ids))
+            batch_sample_idxes = origin_sample_ids[start:end]
+
+            # cal loss per batch
+            loss_framework = self._simulate_train_batch(
+                data,
+                target,
+                batch_id,
+                batch_sample_idxes,
+                is_swapAttack=is_swapAttack,
+                target_label=target_label,
+            )
+
+            if batch_id % 25 == 0:
+                if args.dataset == "Criteo":
+                    num_samples = len(train_loader) * BATCH_SIZE
+                else:
+                    num_samples = len(train_loader.dataset)
+                print(
+                    "Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}".format(
+                        epoch,
+                        batch_id * len(data),
+                        num_samples,
+                        100.0 * batch_id / len(train_loader),
+                        loss_framework.data.item(),
+                    )
+                )
+
+        for scheduler in schedulers:
+            scheduler.step()
+
+    def _simulate_train_batch(
+        self,
+        data,
+        target,
+        batch_id,
+        batch_sample_ids,
+        is_swapAttack=False,
+        target_label=None,
+    ):
         timer_mal = 0
         timer_benign = 0
         # simulate: bottom models forward, top model forward, top model backward and update, bottom backward and update
@@ -329,7 +311,7 @@ class VflFramework(nn.Module):
         input_tensor_top_model_b = torch.tensor([], requires_grad=True)
 
         # --bottom models forward--
-        x_a, x_b = split_data(data)
+        x_a, x_b = self.split_data(data)
 
         # swap attack here
         if is_swapAttack:
@@ -389,12 +371,15 @@ class VflFramework(nn.Module):
             self.grads_a[batch_sample_ids] = grad_output_bottom_model_a.detach()
         else:
             if len(target_batch_ids) > 0:
-                for i, batch_id in enumerate(target_batch_ids):
-                    l2_norm_grad = torch.norm(grad_output_bottom_model_a[batch_id].detach(), p=2).item()
+                for i, id in enumerate(target_batch_ids):
+                    l2_norm_grad = torch.norm(
+                        grad_output_bottom_model_a[id].detach(), p=2
+                    ).item()
                     self.swap_grads[batch_id][i].append(l2_norm_grad)
 
                     l2_norm_grad_dis = torch.norm(
-                        grad_output_bottom_model_a[batch_id].detach() - self.grads_a[target_sample_ids[i]],
+                        grad_output_bottom_model_a[id].detach()
+                        - self.grads_a[target_sample_ids[i]],
                         p=2,
                     ).item()
                     self.swap_grads_dis[batch_id][i].append(l2_norm_grad_dis)
@@ -497,23 +482,22 @@ class VflFramework(nn.Module):
         return loss_framework
 
     def _swap_data(self, x_a, target_batch_ids, target_label):
-        """ x_a: batch data of participant a, tensor
-        """
+        """x_a: batch data of participant a, tensor"""
         if len(target_batch_ids) == 0:
             return x_a
-        
-        swapped_feat = self._get_labeled_feat(self, target_label)
+
+        full_feat = self._get_labeled_feat(target_label)
+        swapped_feat = full_feat[:, :, 0 : args.half]
         for id in target_batch_ids:
             x_a[id] = torch.clone(swapped_feat)
-        
+
         return x_a
-    
+
     def _get_labeled_feat(self, target_label):
-        """Select the sample with the smallest gradient norm among multiple labeled samples.
-        """
+        """Select the sample with the smallest gradient norm among multiple labeled samples."""
         candidate_ids = self.labeled_sample_ids[target_label]
         if len(candidate_ids) == 1:
-           target_sample_id = candidate_ids[0]
+            target_sample_id = candidate_ids[0]
         else:
             l2_norm_grads = torch.norm(self.grads_a[candidate_ids], dim=1)
             target_sample_id = candidate_ids[torch.argmin(l2_norm_grads)]
@@ -521,72 +505,82 @@ class VflFramework(nn.Module):
         feat, _ = self.train_loader.dataset[target_sample_id]
         return feat
 
-    def normal_train_epoch(self, train_loader, origin_sample_ids, schedulers, epoch):
+    def gen_labeled_samples(self, train_loader):
+        """Each class generates a specified number of labeled samples,
+        and we assume that the labeled samples are the ones for which the model fits correctly.
+        Therefore, we select here based on the model prediction results and the norm of the gradient.
+        """
+        targets = train_loader.dataset.targets
+        # Mark whether the sample has been attacked
+        self.attacked_sample_ids = torch.tensor([False for _ in range(len(targets))])
+
+        self.labeled_sample_ids = [[] for _ in range(self.num_classes)]
+        labeled_num = args.labeled_perclass
+
+        # sort according to gradient from small to large
+        l2_norm_per_row = torch.norm(self.grads_a, dim=1)
+        sorted_values, sorted_indices = torch.sort(l2_norm_per_row)
+
+        count = self.num_classes * labeled_num
+        for l2_norm, id in zip(sorted_values, sorted_indices):
+            if self.is_model_output_correct[id]:
+                class_id = targets[id]
+                if len(self.labeled_sample_ids[class_id]) < labeled_num:
+                    self.labeled_sample_ids[class_id].append(id.item())
+                    self.attacked_sample_ids[id] = True
+                    count -= 1
+
+            if count == 0:
+                break
+
         print(
-            "model.optimizer_top_model current lr {:.5e}".format(
-                self.optimizer_top_model.param_groups[0]["lr"]
-            )
+            f"{Style.BRIGHT}{Fore.RED}Labeled samples are generated: {self.labeled_sample_ids}{Style.RESET_ALL}"
         )
+        # print("Predict result:", self.is_model_output_correct[torch.tensor(self.labeled_sample_ids).flatten()].tolist())
         print(
-            "model.optimizer_malicious_bottom_model_a current lr {:.5e}".format(
-                self.optimizer_malicious_bottom_model_a.param_groups[0]["lr"]
-            )
+            "Grads indices:",
+            l2_norm_per_row[torch.tensor(self.labeled_sample_ids).flatten()].tolist(),
         )
-        print(
-            "model.optimizer_benign_bottom_model_b current lr {:.5e}".format(
-                self.optimizer_benign_bottom_model_b.param_groups[0]["lr"]
-            )
-        )
+        print("Max grads:", sorted_values[-10:])
 
-        if self.outputs_a is None:
-            data = [
-                [-1.0 for _ in range(self.num_classes)]
-                for _ in range(len(origin_sample_ids))
-            ]
-            self.outputs_a = torch.tensor(data).to(torch.float).cuda()
-            self.grads_a = torch.tensor(data).to(torch.float).cuda()
-            self.is_model_output_correct = (
-                torch.tensor([False for _ in range(len(origin_sample_ids))])
-                .to(torch.bool)
-                .cuda()
-            )
+    def gen_target_ids(self, origin_sample_ids):
+        """
+        Generate an index of samples to be attacked for the current attack period.
+        Select target samples based on gradient norm.
+        """
+        print("Start generate targets ids per attack period.")
+        l2_norm_samples = torch.norm(self.grads_a, dim=1)
+        self.target_sample_ids, self.target_batch_ids, self.swap_grads = [], [], []
 
-        for batch_id, (data, target) in enumerate(train_loader):
-            # move data to GPU.
-            if args.dataset == "Yahoo":
-                for i in range(len(data)):
-                    data[i] = data[i].long().cuda()
-                target = target[0].long().cuda()
-            else:
-                data = data.float().cuda()
-                target = target.long().cuda()
+        start, end = 0, args.batch_size
+        while start <= end:
+            batch_sample_ids = origin_sample_ids[start:end]
+            l2_norm_batch = l2_norm_samples[batch_sample_ids]
+            sorted_indices = torch.argsort(l2_norm_batch)
 
-            start = batch_id * args.batch_size
-            end = min((batch_id + 1) * args.batch_size, len(origin_sample_ids))
-            batch_sample_idxes = origin_sample_ids[start:end]
+            target_sample_ids_b, target_batch_ids_b, swap_grads_b = [], [], []
+            for batch_id in sorted_indices:
+                sample_id = batch_sample_ids[batch_id]
 
-            # cal loss per batch
-            loss_framework = self._simulate_train_batch(
-                data, target, batch_id, batch_sample_idxes, is_swapAttack=False
-            )
+                if not self.attacked_sample_ids[sample_id]:
+                    target_sample_ids_b.append(sample_id)
+                    target_batch_ids_b.append(batch_id)
+                    swap_grads_b.append([])
 
-            if batch_id % 25 == 0:
-                if args.dataset == "Criteo":
-                    num_samples = len(train_loader) * BATCH_SIZE
-                else:
-                    num_samples = len(train_loader.dataset)
-                print(
-                    "Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}".format(
-                        epoch,
-                        batch_id * len(data),
-                        num_samples,
-                        100.0 * batch_id / len(train_loader),
-                        loss_framework.data.item(),
-                    )
-                )
+                if len(target_sample_ids_b) == args.batch_swap_size:
+                    break
 
-        for scheduler in schedulers:
-            scheduler.step()
+            self.target_sample_ids.append(target_sample_ids_b)
+            self.target_batch_ids.append(target_batch_ids_b)
+            self.swap_grads.append(swap_grads_b)
+
+            start += args.batch_size
+            end += args.batch_size
+            end = min(end, len(origin_sample_ids))
+
+        self.swap_grads_dis = copy.deepcopy(self.swap_grads)
+        print("Generate targets ids done.")
+        return
 
     def test(
         self,
@@ -595,6 +589,8 @@ class VflFramework(nn.Module):
         loss_func_top_model=None,
         is_train_loader=False,
         origin_sample_ids=None,
+        save_to_file=False,
+        file_path="",
     ):
         test_loss = 0
         correct_top1 = 0
@@ -617,7 +613,7 @@ class VflFramework(nn.Module):
                 self.top_model.eval()
 
                 # run forward process of the whole framework
-                x_a, x_b = split_data(data)
+                x_a, x_b = self.split_data(data)
                 output_tensor_bottom_model_a = self.malicious_bottom_model_a(x_a)
                 output_tensor_bottom_model_b = self.benign_bottom_model_b(x_b)
 
@@ -660,37 +656,68 @@ class VflFramework(nn.Module):
             else:
                 num_samples = len(test_loader.dataset)
             test_loss /= num_samples
-            print(
-                "Loss: {:.4f}, Top 1 Accuracy: {}/{} ({:.2f}%), Top {} Accuracy: {}/{} ({:.2f}%)\n".format(
-                    test_loss,
-                    correct_top1,
-                    num_samples,
-                    100.00 * float(correct_top1) / num_samples,
-                    k,
-                    correct_topk,
-                    num_samples,
-                    100.00 * float(correct_topk) / num_samples,
-                )
+            text = "Loss: {:.4f}, Top 1 Accuracy: {}/{} ({:.2f}%), Top {} Accuracy: {}/{} ({:.2f}%)\n".format(
+                test_loss,
+                correct_top1,
+                num_samples,
+                100.00 * float(correct_top1) / num_samples,
+                k,
+                correct_topk,
+                num_samples,
+                100.00 * float(correct_topk) / num_samples,
             )
+            self.print_txtAndStd(save_to_file, text, file_path)
 
-    def eval(self, train_loader, val_loader, origin_sample_ids):
-        """eval model after each train.
-        """
-        print("Evaluation on the training dataset:")
+    def eval(
+        self,
+        train_loader,
+        val_loader,
+        origin_sample_ids,
+        save_to_file=False,
+        file_path="",
+    ):
+        """eval model after each train."""
+        text = "Evaluation on the training dataset:"
+        self.print_txtAndStd(save_to_file, text, file_path)
         self.test(
             test_loader=train_loader,
             k=args.k,
             loss_func_top_model=self.loss_func_top_model,
             is_train_loader=True,
             origin_sample_ids=origin_sample_ids,
+            save_to_file=save_to_file,
+            file_path=file_path,
         )
-
-        print("Evaluation on the testing dataset:")
+        text = "Evaluation on the testing dataset:"
+        self.print_txtAndStd(save_to_file, text, file_path)
         self.test(
             test_loader=val_loader,
             k=args.k,
             loss_func_top_model=self.loss_func_top_model,
+            save_to_file=save_to_file,
+            file_path=file_path,
         )
+
+    def forward(self, x):
+        # in vertical federated setting, each party has non-lapping features of the same sample
+        x_a, x_b = self.split_data(x)
+        out_a = self.malicious_bottom_model_a(x_a)
+        out_b = self.benign_bottom_model_b(x_b)
+        if args.use_top_model:
+            out = self.top_model(out_a, out_b)
+        else:
+            out = out_a + out_b
+        return out
+
+    @staticmethod
+    def print_txtAndStd(save_to_file, text, file_path):
+        if save_to_file:
+            savedStdout = sys.stdout
+            with open(file_path, "a+") as file:
+                sys.stdout = file
+                print(text)
+                sys.stdout = savedStdout
+        print(text)
 
     @staticmethod
     def correct_counter(output, target, topk=(1, 5)):
@@ -701,171 +728,28 @@ class VflFramework(nn.Module):
             correct_counts.append(correct_k)
         return correct_counts
 
-    def gen_labeled_samples(self, train_loader):
-        """Each class generates a specified number of labeled samples,
-        and we assume that the labeled samples are the ones for which the model fits correctly.
-        Therefore, we select here based on the model prediction results and the norm of the gradient.
-        """
-        targets = train_loader.dataset.targets
-        # Mark whether the sample has been attacked
-        self.attacked_sample_ids = torch.tensor([False for _ in len(targets)])
-
-        self.labeled_sample_ids = [[] for _ in range(self.num_classes)]
-        labeled_num = args.labeled_perclass
-
-        # sort according to gradient from small to large
-        l2_norm_per_row = torch.norm(self.grads_a, dim=1)
-        sorted_values, sorted_indices = torch.sort(l2_norm_per_row)
-
-        count = self.num_classes * labeled_num
-        for l2_norm, id in zip(sorted_values, sorted_indices):
-            if self.is_model_output_correct[id]:
-                class_id = targets[id]
-                if len(self.labeled_sample_ids[class_id]) < labeled_num:
-                    self.labeled_sample_ids[class_id].append(id.item())
-                    self.attacked_sample_ids[id] = True
-                    count -= 1
-
-            if count == 0:
-                break
-
-        print(f"{Style.BRIGHT}{Fore.RED}Labeled samples are generated: {self.labeled_sample_ids}{Style.RESET_ALL}")
-        # print("Predict result:", self.is_model_output_correct[torch.tensor(self.labeled_sample_ids).flatten()].tolist())
-        print("Grads indices:", l2_norm_per_row[torch.tensor(self.labeled_sample_ids).flatten()].tolist())
-        print("Max grads:", sorted_values[-10:])
-
-    def gen_target_ids(self, origin_sample_ids):
-        """
-            Generate an index of samples to be attacked for the current attack period.
-            Select target samples based on gradient norm.
-        """
-        print("Start generate targets ids per attack period.")
-        l2_norm_samples = torch.norm(self.grads_a, dim=1)
-        self.target_sample_ids, self.target_batch_ids, self.swap_grads = [], [], []
-
-        start, end = 0, args.batch_size
-        while start <= end:
-            batch_sample_ids = origin_sample_ids[start: end]
-            l2_norm_batch = l2_norm_samples[batch_sample_ids]
-            sorted_indices = torch.argsort(l2_norm_batch)
-
-            target_sample_ids_b, target_batch_ids_b, swap_grads_b = [], [], []
-            for batch_id in sorted_indices:
-                sample_id = batch_sample_ids[batch_id]
-                
-                if not self.attacked_sample_ids[sample_id]:
-                    target_sample_ids_b.append(sample_id)
-                    target_batch_ids_b.append(batch_id)
-                    swap_grads_b.append([])
-
-                if len(target_sample_ids_b) == args.num_swap_batch:
-                    break
-            
-            self.target_sample_ids.append(target_sample_ids_b)
-            self.target_batch_ids.append(target_batch_ids_b)
-            self.swap_grads.append(swap_grads_b)
-
-            start += args.batch_size
-            end += args.batch_size
-            end = min(end, len(origin_sample_ids))
-
-        self.swap_grads_dis = copy.deepcopy(self.swap_grads)
-        print("Generate targets ids done.")
-        return 
-    
-    def swap_attack_epoch(self, train_loader, origin_sample_ids, schedulers, epoch, target_label):
-        if epoch >= args.epochs:
-            return
-
-        print(f"Start swap attack epoch, target calss: {target_label}")
-        for batch_id, (data, target) in enumerate(train_loader):
-            # move data to GPU.
-            if args.dataset == "Yahoo":
-                for i in range(len(data)):
-                    data[i] = data[i].long().cuda()
-                target = target[0].long().cuda()
-            else:
-                data = data.float().cuda()
-                target = target.long().cuda()
-
-            start = batch_id * args.batch_size
-            end = min((batch_id + 1) * args.batch_size, len(origin_sample_ids))
-            batch_sample_idxes = origin_sample_ids[start:end]
-
-            # cal loss per batch
-            loss_framework = self._simulate_train_batch(
-                data, target, batch_id, batch_sample_idxes, 
-                is_swapAttack=True, target_label=target_label,
-            )
-
-            if batch_id % 25 == 0:
-                if args.dataset == "Criteo":
-                    num_samples = len(train_loader) * BATCH_SIZE
-                else:
-                    num_samples = len(train_loader.dataset)
-                print(
-                    "Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}".format(
-                        epoch,
-                        batch_id * len(data),
-                        num_samples,
-                        100.0 * batch_id / len(train_loader),
-                        loss_framework.data.item(),
-                    )
-                )
-
-        for scheduler in schedulers:
-            scheduler.step()
-
-
-def gen_setting_str():
-    # write experiment setting into file name
-    setting_str = ""
-    setting_str += "_"
-    setting_str += "lr="
-    setting_str += str(args.lr)
-    if args.use_mal_optim:
-        setting_str += "_"
-        setting_str += "mal"
-        if args.use_mal_optim_all:
-            setting_str += "-all"
-        if args.use_mal_optim_top:
-            setting_str += "-top"
-    else:
-        setting_str += "_"
-        setting_str += "normal"
-    if args.ppdl:
-        setting_str += "_"
-        setting_str += "ppdl-theta_u="
-        setting_str += str(args.ppdl_theta_u)
-    if args.gc:
-        setting_str += "_"
-        setting_str += "gc-preserved_percent="
-        setting_str += str(args.gc_preserved_percent)
-    if args.lap_noise:
-        setting_str += "_"
-        setting_str += "lap_noise-scale="
-        setting_str += str(args.noise_scale)
-    if args.multistep_grad:
-        setting_str += "_"
-        setting_str += "multistep_grad_bins="
-        setting_str += str(args.multistep_grad_bins)
-    if args.test_upper_bound:
-        setting_str += "_upperbound"
-    setting_str += "_"
-    if args.dataset != "Yahoo":
-        setting_str += "half="
-        setting_str += str(args.half)
-    if not args.use_top_model:
-        setting_str += "_NoTopModel"
-    if args.swap_attack:
-        setting_str += "-epoch="
-        setting_str += str(args.epochs)
-        setting_str += "-attack_latest_epoch="
-        setting_str += str(args.attack_latest_epoch)
-        setting_str += "-labeled_perclass="
-        setting_str += str(args.labeled_perclass)
-    print("settings:", setting_str)
-    return setting_str
+    @staticmethod
+    def split_data(data):
+        if args.dataset == "Yahoo":
+            x_b = data[1]
+            x_a = data[0]
+        elif args.dataset in ["CIFAR10", "CIFAR100", "CINIC10L"]:
+            x_a = data[:, :, :, 0 : args.half]
+            x_b = data[:, :, :, args.half : 32]
+        elif args.dataset == "TinyImageNet":
+            x_a = data[:, :, :, 0 : args.half]
+            x_b = data[:, :, :, args.half : 64]
+        elif args.dataset == "Criteo":
+            x_b = data[:, args.half : D_]
+            x_a = data[:, 0 : args.half]
+        elif args.dataset == "BCW":
+            x_b = data[:, args.half : 28]
+            x_a = data[:, 0 : args.half]
+        else:
+            raise Exception("Unknown dataset name!")
+        if args.test_upper_bound:
+            x_b = torch.zeros_like(x_b)
+        return x_a, x_b
 
 
 def swapAttack():
@@ -894,6 +778,11 @@ def swapAttack():
     dir_save_model = args.save_dir + f"/saved_models/{args.dataset}_saved_models"
     if not os.path.exists(dir_save_model):
         os.makedirs(dir_save_model)
+    txt_name = f"{args.dataset}_swapAttack{setting_str}"
+    file_path = dir_save_model + "/" + txt_name + ".txt"
+    if os.path.exists(file_path):
+        os.remove(file_path)
+
 
     epoch, attack_period = 0, 0
     val_loader = set_test_loader()
@@ -907,13 +796,17 @@ def swapAttack():
 
         # judge whether to start swapAttack
         if not is_start_swapAttack:
-            if epoch >= args.attack_latest_epoch or (judge_converge(grads_a_epochs, args.slope_threshold)):
+            if epoch >= args.attack_latest_epoch or (
+                judge_converge(grads_a_epochs, args.slope_threshold)
+            ):
                 is_start_swapAttack = True
                 model.gen_labeled_samples(train_loader)
 
         if not is_start_swapAttack:
             # conduct normal train
-            model.normal_train_epoch(train_loader, origin_sample_ids, schedulers, epoch)
+            model.simulate_train_epoch(
+                train_loader, origin_sample_ids, schedulers, epoch
+            )
             model.eval(train_loader, val_loader, origin_sample_ids)
             epoch += 1
 
@@ -926,14 +819,29 @@ def swapAttack():
             # for each period of swap attack, we conduct one normal train and n swap train.
             # in the period of swap attack, the train loader keep the same.
             model.gen_target_ids(origin_sample_ids)
-            model.normal_train_epoch(train_loader, origin_sample_ids, schedulers, epoch)
+            model.simulate_train_epoch(
+                train_loader, origin_sample_ids, schedulers, epoch
+            )
             model.eval(train_loader, val_loader, origin_sample_ids)
             epoch += 1
 
             for target_label in list(range(model.num_classes)):
-                model.swap_attack_epoch(train_loader, origin_sample_ids, schedulers, epoch, target_label)
+                model.simulate_train_epoch(
+                    train_loader,
+                    origin_sample_ids,
+                    schedulers,
+                    epoch,
+                    is_swapAttack=True,
+                    target_label=target_label,
+                )
                 epoch += 1
-            
+
+            if (
+                len(model.swap_grads_dis[0]) == 0
+                or len(model.swap_grads_dis[0][0]) != model.num_classes
+            ):
+                break
+
             # gen attack results and fix attack results.
             target_sample_ids_period, inferred_labels_period = [], []
             for batch_id in range(len(model.target_batch_ids)):
@@ -945,160 +853,200 @@ def swapAttack():
                         min_abnormal_grad = min(model.swap_grads[batch_id][i])
                         normal_grad = torch.norm(model.grads_a[sample_id], p=2).item()
                         if min_abnormal_grad <= normal_grad * args.optimal_ratio:
-                            inferred_label = int(np.array(model.swap_grads[batch_id][i]).argmin())
-                    
+                            inferred_label = int(
+                                np.array(model.swap_grads[batch_id][i]).argmin()
+                            )
+
                     target_sample_ids_period.append(sample_id)
                     inferred_labels_period.append(inferred_label)
 
             if len(target_sample_ids_period) > 0:
                 target_sample_ids.extend(target_sample_ids_period)
                 inferred_labels.extend(inferred_labels_period)
-                
-            attack_evaluation(train_loader, model.num_classes, 
-                              target_sample_ids_period, inferred_labels_period, attack_period)
-        
-        attack_evaluation(train_loader, model.num_classes, 
-                            target_sample_ids_period, inferred_labels_period, is_attack_finished=True)
 
-        if epoch == args.epochs:
-            txt_name = f"{args.dataset}_swapAttack{setting_str}"
-            savedStdout = sys.stdout
-            with open(dir_save_model + "/" + txt_name + ".txt", "w+") as file:
-                sys.stdout = file
-                model.eval(train_loader, val_loader, origin_sample_ids)
-                attack_evaluation(train_loader, model.num_classes, 
-                                    target_sample_ids_period, inferred_labels_period, is_attack_finished=True)
-                sys.stdout = savedStdout
-            print("Last epoch evaluation saved to txt!")
+            attack_evaluation(
+                train_loader,
+                model.num_classes,
+                target_sample_ids_period,
+                inferred_labels_period,
+                attack_period,
+                is_attack_finished=False,
+                save_to_file=True,
+                file_path=file_path,
+            )
+
+    attack_evaluation(
+        train_loader,
+        model.num_classes,
+        target_sample_ids,
+        inferred_labels,
+        is_attack_finished=True,
+        save_to_file=True,
+        file_path=file_path,
+    )
+    model.eval(
+        train_loader,
+        val_loader,
+        origin_sample_ids,
+        save_to_file=True,
+        file_path=file_path,
+    )
 
     # save model.
     torch.save(
         model,
-        os.path.join(
-            dir_save_model, f"{args.dataset}_swapAttack{setting_str}.pth"
-        ),
+        os.path.join(dir_save_model, f"{args.dataset}_swapAttack{setting_str}.pth"),
         pickle_module=dill,
     )
 
-def attack_evaluation(train_loader, num_class, target_sample_ids, inferred_labels,
-                      attack_period=-1, is_attack_finished=False):
-    y_true = train_loader.datasets.targets[target_sample_ids].tolist()
-    target_samples_count = len(train_loader.datasets.targets) - args.labeled_perclass*num_class
+
+def attack_evaluation(
+    train_loader,
+    num_class,
+    target_sample_ids,
+    inferred_labels,
+    attack_period=-1,
+    is_attack_finished=False,
+    save_to_file=False,
+    file_path="",
+):
+    y_true = np.array(train_loader.dataset.targets)[target_sample_ids].tolist()
+    target_samples_count = (
+        len(train_loader.dataset.targets) - args.labeled_perclass * num_class
+    )
 
     if len(y_true) != len(inferred_labels):
         raise ValueError("Lengths of y_true and inferred_labels must be the same.")
-    
-    correct_count = sum(1 for true, pred in zip(y_true, inferred_labels) if true == pred)
+
+    correct_count = sum(
+        1 for true, pred in zip(y_true, inferred_labels) if true == pred
+    )
     attack_accuracy = correct_count / len(y_true)
 
     if not is_attack_finished:
-        print(f"{Style.BRIGHT}{Fore.RED}Attack period  : {attack_period}{Style.RESET_ALL}")
+        print(
+            f"{Style.BRIGHT}{Fore.RED}Attack period  : {attack_period}{Style.RESET_ALL}"
+        )
     else:
         print(f"{Style.BRIGHT}{Fore.RED}Swap Attack done. {Style.RESET_ALL}")
+
+    print(
+        f"{Style.BRIGHT}{Fore.RED}Attack Num     : {len(inferred_labels)}{Style.RESET_ALL}"
+    )
+    print(
+        f"{Style.BRIGHT}{Fore.RED}Attack ratio   : {len(inferred_labels)/target_samples_count: .4f}{Style.RESET_ALL}"
+    )
+    print(
+        f"{Style.BRIGHT}{Fore.RED}Attack accuracy: {attack_accuracy: .4f}{Style.RESET_ALL}"
+    )
+
+    if save_to_file:
+        savedStdout = sys.stdout
+        with open(file_path, "a+") as file:
+            sys.stdout = file
+            if not is_attack_finished:
+                print(f"Attack period  : {attack_period}")
+            else:
+                print(f"Swap Attack done.")
+            print(f"Attack Num     : {len(inferred_labels)}")
+            print(f"Attack ratio   : {len(inferred_labels)/target_samples_count: .4f}")
+            print(f"Attack accuracy: {attack_accuracy: .4f}\n")
+            sys.stdout = savedStdout
+        print("Attack evaluation saved to txt!")
+
+
+def set_train_loader():
+    dataset_setup = get_dataset.get_dataset_setup_by_name(args.dataset)
+    train_dataset = dataset_setup.get_transformed_dataset(args.path_dataset, None, True)
+
+    origin_sample_ids = list(range(len(train_dataset)))
+    random.shuffle(origin_sample_ids)
+
+    if args.dataset == "Criteo":
+        train_loader = train_dataset
+    else:
+        train_loader = torch.utils.data.DataLoader(
+            dataset=train_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            sampler=MySequentialSampler(origin_sample_ids)
+            # num_workers=args.workers
+        )
+
+    # check size_bottom_out and num_classes
+    if args.use_top_model is False:
+        if dataset_setup.size_bottom_out != dataset_setup.num_classes:
+            raise Exception(
+                "If no top model is used,"
+                " output tensor of the bottom model must equal to number of classes."
+            )
+
+    return train_loader, origin_sample_ids
+
+
+def set_test_loader():
+    dataset_setup = get_dataset.get_dataset_setup_by_name(args.dataset)
+    test_dataset = dataset_setup.get_transformed_dataset(args.path_dataset, None, False)
+
+    if args.dataset == "Criteo":
+        test_loader = test_dataset
+    else:
+        test_loader = torch.utils.data.DataLoader(
+            dataset=test_dataset,
+            batch_size=args.batch_size,
+            # num_workers=args.workers
+        )
+
+    return test_loader
+
+
+def gen_setting_str():
+    # write experiment setting into file name
+    setting_str = ""
+    setting_str += "-lr="
+    setting_str += str(args.lr)
+    if args.dataset != "Yahoo":
+        setting_str += "-half="
+        setting_str += str(args.half)
+    if not args.use_top_model:
+        setting_str += "-NoTopModel"
+    if not args.swap_attack:
+        setting_str += "-NoSwapAttack"
+    setting_str += "-epoch="
+    setting_str += str(args.epochs)
+    if args.swap_attack:
+        setting_str += "-attack_latest_epoch="
+        setting_str += str(args.attack_latest_epoch)
+        setting_str += "-labeled_perclass="
+        setting_str += str(args.labeled_perclass)
+        setting_str += "-st="
+        setting_str += str(args.slope_threshold)
+    setting_str += "-batch_size="
+    setting_str += str(args.batch_size)
+    if args.swap_attack:
+        setting_str += "-batch-swap-size="
+        setting_str += str(args.batch_swap_size)
+    if args.attack_optim:
+        setting_str += "-AttackOptimal"
+        setting_str += "-optimal_ratio="
+        setting_str += str(args.optimal_ratio)
     
-    print(f"{Style.BRIGHT}{Fore.RED}Attack Num     : {len(inferred_labels)}{Style.RESET_ALL}")
-    print(f"{Style.BRIGHT}{Fore.RED}Attack ratio   : {len(inferred_labels)/target_samples_count: .4f}{Style.RESET_ALL}")
-    print(f"{Style.BRIGHT}{Fore.RED}Attack accuracy: {attack_accuracy: .4f}{Style.RESET_ALL}")
-
-
-def main():
-    setting_str = gen_setting_str()
-    model = VflFramework(setting_str)
-    model = model.cuda()
-    cudnn.benchmark = True
-
-    stone1 = args.stone1  # 50 int(args.epochs * 0.5)
-    stone2 = args.stone2  # 85 int(args.epochs * 0.8)
-    lr_scheduler_top_model = torch.optim.lr_scheduler.MultiStepLR(
-        model.optimizer_top_model, milestones=[stone1, stone2], gamma=args.step_gamma
-    )
-    lr_scheduler_m_a = torch.optim.lr_scheduler.MultiStepLR(
-        model.optimizer_malicious_bottom_model_a,
-        milestones=[stone1, stone2],
-        gamma=args.step_gamma,
-    )
-    lr_scheduler_b_b = torch.optim.lr_scheduler.MultiStepLR(
-        model.optimizer_benign_bottom_model_b,
-        milestones=[stone1, stone2],
-        gamma=args.step_gamma,
-    )
-    schedulers = [lr_scheduler_top_model, lr_scheduler_m_a, lr_scheduler_b_b]
-
-    # train_loader, val_loader = set_loaders()
-    val_loader = set_test_loader()
-
-    dir_save_model = args.save_dir + f"/saved_models/{args.dataset}_saved_models"
-    if not os.path.exists(dir_save_model):
-        os.makedirs(dir_save_model)
-
-    # start training. do evaluation every epoch.
-    for epoch in range(args.epochs):
-        # shuffle data each epoch.
-        train_loader, origin_sample_ids = set_train_loader()
-        model.train_loader = train_loader
+    if args.ppdl:
+        setting_str += "-ppdl-theta_u="
+        setting_str += str(args.ppdl_theta_u)
+    if args.gc:
+        setting_str += "-gc-preserved_percent="
+        setting_str += str(args.gc_preserved_percent)
+    if args.lap_noise:
+        setting_str += "-lap_noise-scale="
+        setting_str += str(args.noise_scale)
+    if args.multistep_grad:
+        setting_str += "-multistep_grad_bins="
+        setting_str += str(args.multistep_grad_bins)
         
-        if epoch == args.epochs - 1 and args.if_cluster_outputsA:
-            model.if_collect_training_dataset_labels = True
+    print("settings:", setting_str)
+    return setting_str
 
-        # conduct normal training
-        model.normal_train_epoch(train_loader, origin_sample_ids, schedulers, epoch)
-        # model eval each epoch:
-        model.eval(train_loader, val_loader, origin_sample_ids)
-
-        if epoch == args.epochs - 1:
-            model.gen_labeled_samples(train_loader)
-            txt_name = f"{args.dataset}_saved_framework{setting_str}"
-            savedStdout = sys.stdout
-            with open(dir_save_model + "/" + txt_name + ".txt", "w+") as file:
-                sys.stdout = file
-                model.eval(train_loader, val_loader, origin_sample_ids)
-                sys.stdout = savedStdout
-            print("Last epoch evaluation saved to txt!")
-
-    # save model
-    torch.save(
-        model,
-        os.path.join(
-            dir_save_model, f"{args.dataset}_saved_framework{setting_str}.pth"
-        ),
-        pickle_module=dill,
-    )
-
-    if args.if_cluster_outputsA:
-        outputsA_list = model.outputs_a.detach().clone().cpu().numpy().tolist()
-        labels_list = (
-            model.labels_training_dataset.detach().clone().cpu().numpy().tolist()
-        )
-        # plot TSNE cluster result
-        outputsA_pca_tsne = TSNE()
-        outputsA_pca_tsne.fit_transform(outputsA_list)
-        df_outputsA_pca_tsne = pd.DataFrame(
-            outputsA_pca_tsne.embedding_, index=labels_list
-        )
-        # plot the TSNE result
-        colors = ["k", "r", "y", "g", "c", "b", "m", "grey", "orange", "pink"]
-        for i in range(model.num_classes):
-            plt.scatter(
-                df_outputsA_pca_tsne.loc[i][0],
-                df_outputsA_pca_tsne.loc[i][1],
-                color=colors[i],
-                marker=".",
-            )
-        plt.title("VFL OutputsA TSNE" + setting_str)
-        # plt.show()
-        dir_save_tsne_pic = args.save_dir + f"/csv_files/{args.dataset}_csv_files"
-        if not os.path.exists(dir_save_tsne_pic):
-            os.makedirs(dir_save_tsne_pic)
-        df_outputsA_pca_tsne.to_csv(
-            dir_save_tsne_pic + f"/{args.dataset}_outputs_a_tsne{setting_str}.csv"
-        )
-        plt.savefig(
-            os.path.join(
-                dir_save_tsne_pic,
-                f"{args.dataset}_Resnet_VFL_OutputsA_TSNE{setting_str}.png",
-            )
-        )
-        plt.close()
 
 def set_parser(parser):
     # dataset paras
@@ -1256,8 +1204,8 @@ def set_parser(parser):
         help="number of total epochs to run",
     )
     parser.add_argument(
-        "-b",
         "--batch-size",
+        "--bs",
         default=32,
         type=int,
         metavar="N",
@@ -1317,6 +1265,13 @@ def set_parser(parser):
         help="number of labeled samples in each class or target class.",
     )
     parser.add_argument(
+        "--batch-swap-size",
+        default=1,
+        type=int,
+        metavar="N",
+        help="Number of samples swapped per batch.",
+    )
+    parser.add_argument(
         "--slope-threshold",
         "--st",
         default=0.0001,
@@ -1338,8 +1293,11 @@ def set_parser(parser):
         help="Constraints on attack optimization. The smaller it is, the stricter it is..",
     )
 
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="vfl framework training")
+    parser = argparse.ArgumentParser(
+        description="The swapping-based label inference attak against vfl framework."
+    )
     set_parser(parser)
     args = parser.parse_args()
     swapAttack()
