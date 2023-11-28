@@ -786,6 +786,10 @@ def swapAttack():
 
     epoch, attack_period = 0, 0
     val_loader = set_test_loader()
+    if args.specified_swap_attack:
+        another_labels = list(set(range(model.num_classes))-set([args.target_label]))
+    else:
+        another_labels = None
 
     is_start_swapAttack, grads_a_epochs = False, []
     target_sample_ids, inferred_labels = [], []
@@ -825,7 +829,13 @@ def swapAttack():
             model.eval(train_loader, val_loader, origin_sample_ids)
             epoch += 1
 
-            for target_label in list(range(model.num_classes)):
+            if args.specified_swap_attack:
+                another_label = random.choice(another_labels)
+                labels = (another_label, args.target_label)
+            else:
+                labels = list(range(model.num_classes))
+            
+            for target_label in labels:
                 model.simulate_train_epoch(
                     train_loader,
                     origin_sample_ids,
@@ -836,9 +846,11 @@ def swapAttack():
                 )
                 epoch += 1
 
+            swap_num = 2 if args.specified_swap_attack else model.num_classes
+            
             if (
                 len(model.swap_grads_dis[0]) == 0
-                or len(model.swap_grads_dis[0][0]) != model.num_classes
+                or len(model.swap_grads_dis[0][0]) != swap_num
             ):
                 break
 
@@ -860,30 +872,33 @@ def swapAttack():
                     target_sample_ids_period.append(sample_id)
                     inferred_labels_period.append(inferred_label)
 
+            print(target_sample_ids_period)
             if len(target_sample_ids_period) > 0:
                 target_sample_ids.extend(target_sample_ids_period)
                 inferred_labels.extend(inferred_labels_period)
 
-            attack_evaluation(
-                train_loader,
-                model.num_classes,
-                target_sample_ids_period,
-                inferred_labels_period,
-                attack_period,
-                is_attack_finished=False,
-                save_to_file=True,
-                file_path=file_path,
-            )
+                attack_evaluation(
+                    train_loader,
+                    model.num_classes,
+                    target_sample_ids_period,
+                    inferred_labels_period,
+                    attack_period,
+                    is_attack_finished=False,
+                    save_to_file=True,
+                    file_path=file_path,
+                )
 
-    attack_evaluation(
-        train_loader,
-        model.num_classes,
-        target_sample_ids,
-        inferred_labels,
-        is_attack_finished=True,
-        save_to_file=True,
-        file_path=file_path,
-    )
+    if len(target_sample_ids) > 0:
+        attack_evaluation(
+            train_loader,
+            model.num_classes,
+            target_sample_ids,
+            inferred_labels,
+            is_attack_finished=True,
+            save_to_file=True,
+            file_path=file_path,
+        )
+
     model.eval(
         train_loader,
         val_loader,
@@ -918,9 +933,15 @@ def attack_evaluation(
     if len(y_true) != len(inferred_labels):
         raise ValueError("Lengths of y_true and inferred_labels must be the same.")
 
-    correct_count = sum(
-        1 for true, pred in zip(y_true, inferred_labels) if true == pred
-    )
+    if args.specified_swap_attack:
+        correct_count = sum(
+            1 for true, pred in zip(y_true, inferred_labels) if (true == args.target_label) == pred
+        )
+    else:
+        correct_count = sum(
+            1 for true, pred in zip(y_true, inferred_labels) if true == pred
+        )
+        
     attack_accuracy = correct_count / len(y_true)
 
     if not is_attack_finished:
@@ -1030,7 +1051,11 @@ def gen_setting_str():
         setting_str += "-AttackOptimal"
         setting_str += "-optimal_ratio="
         setting_str += str(args.optimal_ratio)
-    
+    if args.specified_swap_attack:
+        setting_str += "-specified_swap_attack"
+        setting_str += "-target_label="
+        setting_str += str(args.target_label)
+
     if args.ppdl:
         setting_str += "-ppdl-theta_u="
         setting_str += str(args.ppdl_theta_u)
@@ -1291,6 +1316,18 @@ def set_parser(parser):
         type=float,
         metavar="S",
         help="Constraints on attack optimization. The smaller it is, the stricter it is..",
+    )
+    parser.add_argument(
+        "--specified-swap-attack",
+        type=ast.literal_eval,
+        default=False,
+        help="Whether to perform a swap attack on the specified label",
+    )
+    parser.add_argument(
+        "--target-label",
+        type=int,
+        default=0,
+        help="the specified label for swap attacks",
     )
 
 
