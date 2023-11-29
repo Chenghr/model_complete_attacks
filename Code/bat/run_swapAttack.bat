@@ -30,3 +30,24 @@ python vfl_framework_for_swapattack.py \
 --labeled-perclass 1 --st 0.01 --batch-size 32 --batch-swap-size 2  \
 --attack-optim True --optimal-ratio 0.5 \
 --specified-swap-attack False --target-label 0 
+
+:: specific attack.
+python vfl_framework_for_swapattack.py \
+-d CIFAR10 --path-dataset ./data/CIFAR10 \
+--k 3  --half 16 \
+--swap-attack True \
+--epochs 150 --attack-latest-epoch 50 \
+--labeled-perclass 1 --st 0.0001 --batch-size 32 --batch-swap-size 1  \
+--attack-optim True --optimal-ratio 0.5 \
+--specified-swap-attack False --target-label 0 
+
+python vfl_framework_for_swapattack.py \
+-d CIFAR10 --path-dataset ./data/CIFAR10 \
+--k 3  --half 16 \
+--swap-attack True \
+--epochs 150 --attack-latest-epoch 50 \
+--labeled-perclass 1 --st 0.0001 --batch-size 32 --batch-swap-size 1  \
+--attack-optim True --optimal-ratio 0.5 \
+--specified-swap-attack False --target-label 6
+
+conda activate swapAttack

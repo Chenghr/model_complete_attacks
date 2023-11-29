@@ -23,6 +23,6 @@ print(f"Latest Slope (最新数据点的斜率): {latest_slope}")
 
 # 绘制原始数据和拟合曲线
 plt.scatter(x_data, y_data, label="原始数据")
-plt.plot(x_data, fitted_values, color='red', label="拟合曲线")
+plt.plot(x_data, fitted_values, color="red", label="拟合曲线")
 plt.legend()
 plt.show()
